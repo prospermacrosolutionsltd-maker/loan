@@ -1,8 +1,10 @@
+import plotly.express as px # type: ignore
 import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
 import io
+import hashlib
 
 # ====================== DATABASE ======================
 conn = sqlite3.connect('loans.db', check_same_thread=False)
@@ -49,11 +51,17 @@ def get_loan_status(balance, penalty):
         return "⚠️ Overdue"
     return "Active"
 
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
 # ====================== LOGIN ======================
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.user_role = None
-    st.session_state.username = None
+hashed = hash_password(password)
+
+user = pd.read_sql_query(
+    "SELECT * FROM users WHERE username=? AND password=?",
+    conn,
+    params=(username, hashed)
+)
 
 if not st.session_state.logged_in:
     st.title("🔐 PROSPER MACRO SOLUTIONS LTD")
@@ -76,20 +84,76 @@ st.set_page_config(page_title="Prosper Macro Loans", layout="wide")
 st.title("💼 PROSPER MACRO SOLUTIONS LTD")
 st.subheader(f"Loan Management System | {st.session_state.username} ({st.session_state.user_role})")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Dashboard", "📝 New Loan", "📋 Portfolio", "💰 Record Payment", "📋 Reports", "✏️ Manage Loan"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.ttab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📊 Dashboard",
+    "📝 New Loan",
+    "📋 Portfolio",
+    "💰 Record Payment",
+    "📋 Reports",
+    "✏️ Manage Loan",
+    "👥 Admin"
+])
 
 # ====================== DASHBOARD ======================
 with tab1:
     st.subheader("Business Dashboard")
-    df = pd.read_sql_query("SELECT * FROM loans", conn)
+    payments_df = pd.read_sql_query("SELECT * FROM payments", conn)
+total_collected = payments_df['amount'].sum() if not payments_df.empty else 0
     if not df.empty:
         df['balance'] = df.apply(lambda x: calculate_balance(x['total_repayment'], x['amount_paid']), axis=1)
         df['penalty'] = df.apply(lambda x: calculate_penalty(x['due_date'], x['balance'], x['frozen'], x.get('is_balance_frozen', 0)), axis=1)
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Disbursed", f"UGX {df['amount'].sum():,.0f}")
-        col2.metric("Outstanding", f"UGX {df['balance'].sum():,.0f}")
-        col3.metric("Overdue Loans", len(df[df['penalty'] > 0]))
-        col4.metric("Total Loans", len(df))
+       col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric(
+    "Total Disbursed",
+    f"UGX {df['amount'].sum():,.0f}"
+)
+col2.metric(
+    "Outstanding",
+    f"UGX {df['balance'].sum():,.0f}"
+)
+col3.metric(
+    "Total Collected",
+    f"UGX {total_collected:,.0f}"
+)
+col4.metric(
+    "Overdue Loans",
+    len(df[df['penalty'] > 0])
+)
+col5.metric(
+    "Total Loans",
+    len(df)
+)
+status_counts = df['status'].value_counts().reset_index()
+status_counts.columns = ['Status', 'Count']
+fig1 = px.pie(
+    status_counts,
+    names='Status',
+    values='Count',
+    title='Loan Status Distribution'
+)
+st.plotly_chart(fig1, use_container_width=True)
+officer_summary = df.groupby('loan_officer')['amount_paid'].sum().reset_index()
+fig2 = px.bar(
+    officer_summary,
+    x='loan_officer',
+    y='amount_paid',
+    title='Collections by Loan Officer'
+)
+st.plotly_chart(fig2, use_container_width=True)
+if not payments_df.empty:
+    payments_df['payment_date'] = pd.to_datetime(
+        payments_df['payment_date']
+    )
+    payments_df['month'] = payments_df['payment_date'].dt.strftime('%Y-%m')
+    monthly = payments_df.groupby('month')['amount'].sum().reset_index()
+    fig3 = px.line(
+        monthly,
+        x='month',
+        y='amount',
+        markers=True,
+        title='Monthly Collections'
+    )
+    st.plotly_chart(fig3, use_container_width=True)
         st.dataframe(df[['id','borrower_name','amount','balance','penalty','loan_officer']], use_container_width=True, hide_index=True)
 
 # ====================== NEW LOAN ======================
@@ -294,3 +358,109 @@ if st.sidebar.button("Logout"):
     for key in list(st.session_state.keys()):
         del st.session_state[key]
     st.rerun()
+    # ====================== ADMIN ======================
+with tab7:
+
+    if st.session_state.user_role != "Admin":
+        st.error("Access denied. Admin only.")
+        st.stop()
+
+    st.subheader("👥 User Administration")
+
+    admin_action = st.selectbox(
+        "Choose Action",
+        ["View Users", "Add User", "Change Password", "Delete User"]
+    )
+
+    # ================= VIEW USERS =================
+    if admin_action == "View Users":
+        users_df = pd.read_sql_query(
+            "SELECT id, username, role, full_name FROM users",
+            conn
+        )
+
+        st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+    # ================= ADD USER =================
+    elif admin_action == "Add User":
+
+        st.write("### Add New User")
+
+        new_fullname = st.text_input("Full Name")
+        new_username = st.text_input("Username")
+        new_password = st.text_input("Password", type="password")
+        new_role = st.selectbox("Role", ["Admin", "Officer"])
+
+        if st.button("➕ Create User"):
+
+            try:
+                c.execute("""
+                    INSERT INTO users (username, password, role, full_name)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    new_username,
+                    new_password,
+                    new_role,
+                    new_fullname
+                ))
+
+                conn.commit()
+
+                st.success("✅ User created successfully!")
+
+            except:
+                st.error("Username already exists")
+
+    # ================= CHANGE PASSWORD =================
+    elif admin_action == "Change Password":
+
+        users = pd.read_sql_query(
+            "SELECT username FROM users",
+            conn
+        )
+
+        selected_user = st.selectbox(
+            "Select User",
+            users['username']
+        )
+
+        new_pass = st.text_input(
+            "New Password",
+            type="password"
+        )
+
+        if st.button("🔑 Update Password"):
+
+            c.execute("""
+                UPDATE users
+                SET password=?
+                WHERE username=?
+            """, (new_pass, selected_user))
+
+            conn.commit()
+
+            st.success("✅ Password updated!")
+
+    # ================= DELETE USER =================
+    elif admin_action == "Delete User":
+
+        users = pd.read_sql_query(
+            "SELECT username FROM users WHERE username != 'admin'",
+            conn
+        )
+
+        del_user = st.selectbox(
+            "Select User",
+            users['username']
+        )
+
+        if st.button("🗑️ Delete User"):
+
+            c.execute(
+                "DELETE FROM users WHERE username=?",
+                (del_user,)
+            )
+
+            conn.commit()
+
+            st.success("✅ User deleted!")
