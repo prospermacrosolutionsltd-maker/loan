@@ -23,8 +23,14 @@ c.execute('''CREATE TABLE IF NOT EXISTS loans (
 c.execute('''CREATE TABLE IF NOT EXISTS payments (
              id INTEGER PRIMARY KEY, loan_id INTEGER, amount REAL, payment_date TEXT)''')
 
-c.execute("INSERT OR IGNORE INTO users (username, password, role, full_name) VALUES ('admin', '123456', 'Admin', 'System Administrator')")
-c.execute("INSERT OR IGNORE INTO users (username, password, role, full_name) VALUES ('officer1', '1234', 'Officer', 'John Officer')")
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+# Ensure default users exist with hashed passwords
+c.execute("INSERT OR IGNORE INTO users (username, password, role, full_name) VALUES (?,?,?,?)",
+          ('admin', hash_password('123456'), 'Admin', 'System Administrator'))
+c.execute("INSERT OR IGNORE INTO users (username, password, role, full_name) VALUES (?,?,?,?)",
+          ('officer1', hash_password('1234'), 'Officer', 'John Officer'))
 conn.commit()
 
 # ====================== HELPER FUNCTIONS ======================
@@ -51,17 +57,46 @@ def get_loan_status(balance, penalty):
         return "⚠️ Overdue"
     return "Active"
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+
+def load_loans():
+    loans = pd.read_sql_query("SELECT * FROM loans ORDER BY id ASC", conn)
+    if loans.empty:
+        return loans
+
+    loans['balance'] = loans.apply(lambda x: calculate_balance(x.get('total_repayment', 0), x.get('amount_paid', 0)), axis=1)
+    loans['penalty'] = loans.apply(
+        lambda x: calculate_penalty(
+            x.get('due_date', ''),
+            x.get('balance', 0),
+            x.get('frozen', 0),
+            x.get('is_balance_frozen', 0)
+        ),
+        axis=1
+    )
+    loans['total_due'] = loans['balance'] + loans['penalty']
+    loans['status'] = loans.apply(lambda x: get_loan_status(x['balance'], x['penalty']), axis=1)
+    return loans
+
+
+def filter_loans(df, borrower, phone, officer, status, overdue):
+    if borrower:
+        df = df[df['borrower_name'].str.contains(borrower, case=False, na=False)]
+    if phone:
+        df = df[df['phone'].str.contains(phone, case=False, na=False)]
+    if officer:
+        df = df[df['loan_officer'].str.contains(officer, case=False, na=False)]
+    if status and status != 'All':
+        df = df[df['status'] == status]
+    if overdue == 'Only overdue':
+        df = df[df['penalty'] > 0]
+    return df
 
 # ====================== LOGIN ======================
-hashed = hash_password(password)
-
-user = pd.read_sql_query(
-    "SELECT * FROM users WHERE username=? AND password=?",
-    conn,
-    params=(username, hashed)
-)
+# Initialize session state defaults
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.user_role = ''
+    st.session_state.username = ''
 
 if not st.session_state.logged_in:
     st.title("🔐 PROSPER MACRO SOLUTIONS LTD")
@@ -69,11 +104,12 @@ if not st.session_state.logged_in:
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
     if st.button("Login"):
-        user = pd.read_sql_query("SELECT * FROM users WHERE username=? AND password=?", conn, params=(username, password))
+        hashed = hash_password(password)
+        user = pd.read_sql_query("SELECT * FROM users WHERE username=? AND password=?", conn, params=(username, hashed))
         if not user.empty:
             st.session_state.logged_in = True
             st.session_state.user_role = user.iloc[0]['role']
-            st.session_state.username = username
+            st.session_state.username = user.iloc[0]['username']
             st.rerun()
         else:
             st.error("Invalid credentials")
@@ -84,7 +120,7 @@ st.set_page_config(page_title="Prosper Macro Loans", layout="wide")
 st.title("💼 PROSPER MACRO SOLUTIONS LTD")
 st.subheader(f"Loan Management System | {st.session_state.username} ({st.session_state.user_role})")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.ttab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Dashboard",
     "📝 New Loan",
     "📋 Portfolio",
@@ -98,63 +134,39 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.ttab1, tab2, tab3, tab4, tab5, tab6, tab
 with tab1:
     st.subheader("Business Dashboard")
     payments_df = pd.read_sql_query("SELECT * FROM payments", conn)
-total_collected = payments_df['amount'].sum() if not payments_df.empty else 0
+    df = load_loans()
+    total_collected = payments_df['amount'].sum() if not payments_df.empty else 0
+
     if not df.empty:
-        df['balance'] = df.apply(lambda x: calculate_balance(x['total_repayment'], x['amount_paid']), axis=1)
-        df['penalty'] = df.apply(lambda x: calculate_penalty(x['due_date'], x['balance'], x['frozen'], x.get('is_balance_frozen', 0)), axis=1)
-       col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric(
-    "Total Disbursed",
-    f"UGX {df['amount'].sum():,.0f}"
-)
-col2.metric(
-    "Outstanding",
-    f"UGX {df['balance'].sum():,.0f}"
-)
-col3.metric(
-    "Total Collected",
-    f"UGX {total_collected:,.0f}"
-)
-col4.metric(
-    "Overdue Loans",
-    len(df[df['penalty'] > 0])
-)
-col5.metric(
-    "Total Loans",
-    len(df)
-)
-status_counts = df['status'].value_counts().reset_index()
-status_counts.columns = ['Status', 'Count']
-fig1 = px.pie(
-    status_counts,
-    names='Status',
-    values='Count',
-    title='Loan Status Distribution'
-)
-st.plotly_chart(fig1, use_container_width=True)
-officer_summary = df.groupby('loan_officer')['amount_paid'].sum().reset_index()
-fig2 = px.bar(
-    officer_summary,
-    x='loan_officer',
-    y='amount_paid',
-    title='Collections by Loan Officer'
-)
-st.plotly_chart(fig2, use_container_width=True)
-if not payments_df.empty:
-    payments_df['payment_date'] = pd.to_datetime(
-        payments_df['payment_date']
-    )
-    payments_df['month'] = payments_df['payment_date'].dt.strftime('%Y-%m')
-    monthly = payments_df.groupby('month')['amount'].sum().reset_index()
-    fig3 = px.line(
-        monthly,
-        x='month',
-        y='amount',
-        markers=True,
-        title='Monthly Collections'
-    )
-    st.plotly_chart(fig3, use_container_width=True)
-        st.dataframe(df[['id','borrower_name','amount','balance','penalty','loan_officer']], use_container_width=True, hide_index=True)
+        col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
+        col1.metric("Total Disbursed", f"UGX {df['amount'].sum():,.0f}")
+        col2.metric("Outstanding", f"UGX {df['balance'].sum():,.0f}")
+        col3.metric("Total Collected", f"UGX {total_collected:,.0f}")
+        col4.metric("Overdue Loans", len(df[df['penalty'] > 0]))
+        col5.metric("Total Loans", len(df))
+
+        with st.expander("📌 Key Portfolio Charts", expanded=True):
+            status_counts = df['status'].value_counts().reset_index()
+            status_counts.columns = ['Status', 'Count']
+            fig1 = px.pie(status_counts, names='Status', values='Count', title='Loan Status Distribution')
+            st.plotly_chart(fig1, use_container_width=True)
+
+            officer_summary = df.groupby('loan_officer')['amount_paid'].sum().reset_index()
+            fig2 = px.bar(officer_summary, x='loan_officer', y='amount_paid', title='Collections by Loan Officer')
+            st.plotly_chart(fig2, use_container_width=True)
+
+            if not payments_df.empty:
+                payments_df['payment_date'] = pd.to_datetime(payments_df['payment_date'])
+                payments_df['month'] = payments_df['payment_date'].dt.strftime('%Y-%m')
+                monthly = payments_df.groupby('month')['amount'].sum().reset_index()
+                fig3 = px.line(monthly, x='month', y='amount', markers=True, title='Monthly Collections')
+                st.plotly_chart(fig3, use_container_width=True)
+
+        st.markdown("---")
+        with st.expander("📋 Recent Loans", expanded=True):
+            st.dataframe(df[['id', 'borrower_name', 'phone', 'amount', 'balance', 'penalty', 'loan_officer']], use_container_width=True, hide_index=True)
+    else:
+        st.info("No loans found.")
 
 # ====================== NEW LOAN ======================
 with tab2:
@@ -188,8 +200,8 @@ with tab3:
     df = pd.read_sql_query("SELECT * FROM loans ORDER BY id ASC", conn)
     
     if not df.empty:
-        df['balance'] = df.apply(lambda x: calculate_balance(x['total_repayment'], x['amount_paid']), axis=1)
-        df['penalty'] = df.apply(lambda x: calculate_penalty(x['due_date'], x['balance'], x['frozen'], x.get('is_balance_frozen', 0)), axis=1)
+        df['balance'] = df.apply(lambda x: calculate_balance(x.get('total_repayment', 0), x.get('amount_paid', 0)), axis=1)
+        df['penalty'] = df.apply(lambda x: calculate_penalty(x.get('due_date', ''), x.get('balance', 0), x.get('frozen', 0), x.get('is_balance_frozen', 0)), axis=1)
         df['total_due'] = df['balance'] + df['penalty']
         df['status'] = df.apply(lambda x: get_loan_status(x['balance'], x['penalty']), axis=1)
         
@@ -247,8 +259,8 @@ with tab5:
     elif report_type == "Overdue Loans":
         df = pd.read_sql_query("SELECT * FROM loans", conn)
         if not df.empty:
-            df['balance'] = df.apply(lambda x: calculate_balance(x['total_repayment'], x['amount_paid']), axis=1)
-            df['penalty'] = df.apply(lambda x: calculate_penalty(x['due_date'], x['balance'], x['frozen'], x.get('is_balance_frozen', 0)), axis=1)
+            df['balance'] = df.apply(lambda x: calculate_balance(x.get('total_repayment', 0), x.get('amount_paid', 0)), axis=1)
+            df['penalty'] = df.apply(lambda x: calculate_penalty(x.get('due_date', ''), x.get('balance', 0), x.get('frozen', 0), x.get('is_balance_frozen', 0)), axis=1)
             overdue = df[df['penalty'] > 0].copy()
             if not overdue.empty:
                 st.dataframe(overdue, use_container_width=True, hide_index=True)
@@ -257,8 +269,8 @@ with tab5:
     else:
         df = pd.read_sql_query("SELECT * FROM loans", conn)
         if not df.empty:
-            df['balance'] = df.apply(lambda x: calculate_balance(x['total_repayment'], x['amount_paid']), axis=1)
-            df['penalty'] = df.apply(lambda x: calculate_penalty(x['due_date'], x['balance'], x['frozen'], x.get('is_balance_frozen', 0)), axis=1)
+            df['balance'] = df.apply(lambda x: calculate_balance(x.get('total_repayment', 0), x.get('amount_paid', 0)), axis=1)
+            df['penalty'] = df.apply(lambda x: calculate_penalty(x.get('due_date', ''), x.get('balance', 0), x.get('frozen', 0), x.get('is_balance_frozen', 0)), axis=1)
             df['total_due'] = df['balance'] + df['penalty']
             
             col_exp1, col_exp2 = st.columns([1, 4])
@@ -399,7 +411,7 @@ with tab7:
                     VALUES (?, ?, ?, ?)
                 """, (
                     new_username,
-                    new_password,
+                    hash_password(new_password),
                     new_role,
                     new_fullname
                 ))
@@ -435,7 +447,7 @@ with tab7:
                 UPDATE users
                 SET password=?
                 WHERE username=?
-            """, (new_pass, selected_user))
+            """, (hash_password(new_pass), selected_user))
 
             conn.commit()
 
