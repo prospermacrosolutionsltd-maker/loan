@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 import io
 import hashlib
 
+st.set_page_config(page_title="Prosper Macro Loans", layout="wide")
+
 # ====================== DATABASE ======================
 conn = sqlite3.connect('loans.db', check_same_thread=False)
 c = conn.cursor()
@@ -18,7 +20,18 @@ c.execute('''CREATE TABLE IF NOT EXISTS loans (
              interest_rate REAL, term_months INTEGER, total_repayment REAL,
              disbursement_date TEXT, due_date TEXT, amount_paid REAL DEFAULT 0,
              loan_officer TEXT, frozen INTEGER DEFAULT 0,
-             is_balance_frozen INTEGER DEFAULT 0, frozen_balance REAL DEFAULT 0)''')
+             is_balance_frozen INTEGER DEFAULT 0, frozen_balance REAL DEFAULT 0,
+             collateral_type TEXT DEFAULT '', admin_fee REAL DEFAULT 0)''')
+
+# Ensure existing databases have new columns for collateral and administration fee.
+for column_sql in [
+    "ALTER TABLE loans ADD COLUMN collateral_type TEXT DEFAULT ''",
+    "ALTER TABLE loans ADD COLUMN admin_fee REAL DEFAULT 0"
+]:
+    try:
+        c.execute(column_sql)
+    except sqlite3.OperationalError:
+        pass
 
 c.execute('''CREATE TABLE IF NOT EXISTS payments (
              id INTEGER PRIMARY KEY, loan_id INTEGER, amount REAL, payment_date TEXT)''')
@@ -116,7 +129,6 @@ if not st.session_state.logged_in:
     st.stop()
 
 # ====================== APP ======================
-st.set_page_config(page_title="Prosper Macro Loans", layout="wide")
 st.title("💼 PROSPER MACRO SOLUTIONS LTD")
 st.subheader(f"Loan Management System | {st.session_state.username} ({st.session_state.user_role})")
 
@@ -181,42 +193,61 @@ with tab2:
         rate = st.number_input("Interest Rate (%)", value=14.0, step=0.5)
         months = st.number_input("Term (Months)", min_value=1, value=1)
         disb_date = st.date_input("Disbursement Date", datetime.now().date())
+        collateral_type = st.selectbox(
+            "Type of Collateral Offered",
+            ["None", "Land Title", "Vehicle", "Equipment", "Property", "Savings"],
+            index=0
+        )
+        admin_fee_input = st.number_input("Administration Fee (UGX)", min_value=0, value=10000, step=1000,
+                                         help="This fee is applied only for new customers.")
     
     if st.button("💾 Save New Loan", type="primary"):
         if name and phone:
-            total = amount * (1 + (rate / 100) * months)
+            existing_customer = c.execute("SELECT COUNT(*) FROM loans WHERE borrower_name=?", (name,)).fetchone()[0] > 0
+            admin_fee = 0 if existing_customer else admin_fee_input
+            total = amount * (1 + (rate / 100) * months) + admin_fee
             due_date = disb_date + timedelta(days=30 * months)
             c.execute("""INSERT INTO loans (borrower_name, phone, amount, interest_rate, term_months, 
-                         total_repayment, disbursement_date, due_date, loan_officer)
-                         VALUES (?,?,?,?,?,?,?,?,?)""", 
-                      (name, phone, amount, rate, months, total, str(disb_date), str(due_date), officer))
+                         total_repayment, disbursement_date, due_date, loan_officer, collateral_type, admin_fee)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?)""", 
+                      (name, phone, amount, rate, months, total, str(disb_date), str(due_date), officer,
+                       collateral_type, admin_fee))
             conn.commit()
-            st.success(f"✅ Loan for **{name}** created!")
+            if existing_customer:
+                st.success(f"✅ Loan for **{name}** created without administration fee.")
+            else:
+                st.success(f"✅ New customer loan created with UGX {admin_fee:,.0f} administration fee.")
             st.rerun()
 
 # ====================== PORTFOLIO ======================
 with tab3:
     st.subheader("Loans Portfolio")
-    df = pd.read_sql_query("SELECT * FROM loans ORDER BY id ASC", conn)
-    
+    df = load_loans()
+
     if not df.empty:
-        df['balance'] = df.apply(lambda x: calculate_balance(x.get('total_repayment', 0), x.get('amount_paid', 0)), axis=1)
-        df['penalty'] = df.apply(lambda x: calculate_penalty(x.get('due_date', ''), x.get('balance', 0), x.get('frozen', 0), x.get('is_balance_frozen', 0)), axis=1)
-        df['total_due'] = df['balance'] + df['penalty']
-        df['status'] = df.apply(lambda x: get_loan_status(x['balance'], x['penalty']), axis=1)
-        
-        # Export Button at Top
+        borrower_search, phone_search, officer_search = st.columns(3)
+        with borrower_search:
+            borrower = st.text_input("Borrower Name")
+        with phone_search:
+            phone = st.text_input("Phone Number")
+        with officer_search:
+            officer = st.text_input("Loan Officer")
+
+        status = st.selectbox("Status", ["All", "Active", "⚠️ Overdue", "✅ Fully Paid"], key="portfolio_status")
+        overdue = st.selectbox("Overdue Filter", ["All", "Only overdue"], key="portfolio_overdue")
+
+        filtered_df = filter_loans(df, borrower, phone, officer, status, overdue)
+
         col_exp1, col_exp2 = st.columns([1, 4])
         with col_exp1:
-            if st.button("📥 Export to Excel"):
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False)
-                output.seek(0)
-                st.download_button("⬇️ Download Portfolio", output, "portfolio.xlsx", 
-                                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="exp_port")
-        
-        st.dataframe(df, use_container_width=True, hide_index=True)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                filtered_df.to_excel(writer, index=False)
+            output.seek(0)
+            st.download_button("⬇️ Download Portfolio", output, "portfolio.xlsx", 
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="exp_port")
+
+        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
     else:
         st.info("No loans found.")
 
@@ -246,7 +277,8 @@ with tab4:
 with tab5:
     st.subheader("Reports & Statements")
     report_type = st.selectbox("Select Report", ["Portfolio Summary", "Overdue Loans", "Loan Statement"])
-    
+    df = load_loans()
+
     if report_type == "Loan Statement":
         stmt_id = st.number_input("Enter Loan ID", min_value=1)
         if st.button("Generate Statement"):
@@ -256,34 +288,39 @@ with tab5:
                 st.dataframe(loan, hide_index=True)
                 st.subheader("Payment History")
                 st.dataframe(payments, hide_index=True)
-    elif report_type == "Overdue Loans":
-        df = pd.read_sql_query("SELECT * FROM loans", conn)
-        if not df.empty:
-            df['balance'] = df.apply(lambda x: calculate_balance(x.get('total_repayment', 0), x.get('amount_paid', 0)), axis=1)
-            df['penalty'] = df.apply(lambda x: calculate_penalty(x.get('due_date', ''), x.get('balance', 0), x.get('frozen', 0), x.get('is_balance_frozen', 0)), axis=1)
-            overdue = df[df['penalty'] > 0].copy()
-            if not overdue.empty:
-                st.dataframe(overdue, use_container_width=True, hide_index=True)
             else:
-                st.success("🎉 No overdue loans at the moment!")
+                st.error("Loan not found.")
+
+    elif report_type == "Overdue Loans":
+        overdue = df[df['penalty'] > 0].copy()
+        if not overdue.empty:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                overdue.to_excel(writer, index=False)
+            output.seek(0)
+            st.download_button("⬇️ Download Overdue Report", output, "overdue_loans.xlsx", 
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="exp_overdue")
+            st.dataframe(overdue, use_container_width=True, hide_index=True)
+        else:
+            st.success("🎉 No overdue loans at the moment!")
+
     else:
-        df = pd.read_sql_query("SELECT * FROM loans", conn)
         if not df.empty:
-            df['balance'] = df.apply(lambda x: calculate_balance(x.get('total_repayment', 0), x.get('amount_paid', 0)), axis=1)
-            df['penalty'] = df.apply(lambda x: calculate_penalty(x.get('due_date', ''), x.get('balance', 0), x.get('frozen', 0), x.get('is_balance_frozen', 0)), axis=1)
             df['total_due'] = df['balance'] + df['penalty']
-            
-            col_exp1, col_exp2 = st.columns([1, 4])
-            with col_exp1:
-                if st.button("📥 Export Summary to Excel"):
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        df.to_excel(writer, index=False)
-                    output.seek(0)
-                    st.download_button("⬇️ Download Summary", output, "portfolio_summary.xlsx", 
-                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            
+            st.metric("Total Loans", len(df))
+            st.metric("Outstanding", f"UGX {df['balance'].sum():,.0f}")
+            st.metric("Overdue Loans", len(df[df['penalty'] > 0]))
+
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False)
+            output.seek(0)
+            st.download_button("⬇️ Download Portfolio Summary", output, "portfolio_summary.xlsx", 
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="exp_summary")
+
             st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No loans found.")
 
 # ====================== MANAGE LOAN ======================
 with tab6:
