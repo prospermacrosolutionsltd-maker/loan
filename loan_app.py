@@ -21,12 +21,14 @@ c.execute('''CREATE TABLE IF NOT EXISTS loans (
              disbursement_date TEXT, due_date TEXT, amount_paid REAL DEFAULT 0,
              loan_officer TEXT, frozen INTEGER DEFAULT 0,
              is_balance_frozen INTEGER DEFAULT 0, frozen_balance REAL DEFAULT 0,
-             collateral_type TEXT DEFAULT '', admin_fee REAL DEFAULT 0)''')
+             collateral_type TEXT DEFAULT '', admin_fee REAL DEFAULT 0,
+             loan_status TEXT DEFAULT 'Active')''')
 
-# Ensure existing databases have new columns for collateral and administration fee.
+# Ensure existing databases have new columns
 for column_sql in [
     "ALTER TABLE loans ADD COLUMN collateral_type TEXT DEFAULT ''",
-    "ALTER TABLE loans ADD COLUMN admin_fee REAL DEFAULT 0"
+    "ALTER TABLE loans ADD COLUMN admin_fee REAL DEFAULT 0",
+    "ALTER TABLE loans ADD COLUMN loan_status TEXT DEFAULT 'Active'"
 ]:
     try:
         c.execute(column_sql)
@@ -35,6 +37,20 @@ for column_sql in [
 
 c.execute('''CREATE TABLE IF NOT EXISTS payments (
              id INTEGER PRIMARY KEY, loan_id INTEGER, amount REAL, payment_date TEXT)''')
+
+c.execute('''CREATE TABLE IF NOT EXISTS topups (
+             id INTEGER PRIMARY KEY, loan_id INTEGER, topup_amount REAL, 
+             topup_date TEXT, additional_months INTEGER, previous_balance REAL,
+             new_due_date TEXT)''')
+
+# Create topups table if it doesn't exist
+try:
+    c.execute('''CREATE TABLE IF NOT EXISTS topups (
+                 id INTEGER PRIMARY KEY, loan_id INTEGER, topup_amount REAL, 
+                 topup_date TEXT, additional_months INTEGER, previous_balance REAL,
+                 new_due_date TEXT)''')
+except sqlite3.OperationalError:
+    pass
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -72,7 +88,7 @@ def get_loan_status(balance, penalty):
 
 
 def load_loans():
-    loans = pd.read_sql_query("SELECT * FROM loans ORDER BY id ASC", conn)
+    loans = pd.read_sql_query("SELECT * FROM loans WHERE loan_status='Active' ORDER BY id ASC", conn)
     if loans.empty:
         return loans
 
@@ -203,15 +219,15 @@ with tab2:
     
     if st.button("💾 Save New Loan", type="primary"):
         if name and phone:
-            existing_customer = c.execute("SELECT COUNT(*) FROM loans WHERE borrower_name=?", (name,)).fetchone()[0] > 0
+            existing_customer = c.execute("SELECT COUNT(*) FROM loans WHERE borrower_name=? AND phone=? AND loan_status='Completed'", (name, phone)).fetchone()[0] > 0
             admin_fee = 0 if existing_customer else admin_fee_input
             total = amount * (1 + (rate / 100) * months) + admin_fee
             due_date = disb_date + timedelta(days=30 * months)
             c.execute("""INSERT INTO loans (borrower_name, phone, amount, interest_rate, term_months, 
-                         total_repayment, disbursement_date, due_date, loan_officer, collateral_type, admin_fee)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?)""", 
+                         total_repayment, disbursement_date, due_date, loan_officer, collateral_type, admin_fee, loan_status)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", 
                       (name, phone, amount, rate, months, total, str(disb_date), str(due_date), officer,
-                       collateral_type, admin_fee))
+                       collateral_type, admin_fee, 'Active'))
             conn.commit()
             if existing_customer:
                 st.success(f"✅ Loan for **{name}** created without administration fee.")
@@ -284,10 +300,14 @@ with tab5:
         if st.button("Generate Statement"):
             loan = pd.read_sql_query("SELECT * FROM loans WHERE id=?", conn, params=(stmt_id,))
             payments = pd.read_sql_query("SELECT * FROM payments WHERE loan_id=? ORDER BY payment_date DESC", conn, params=(stmt_id,))
+            topups = pd.read_sql_query("SELECT * FROM topups WHERE loan_id=? ORDER BY topup_date DESC", conn, params=(stmt_id,))
             if not loan.empty:
                 st.dataframe(loan, hide_index=True)
                 st.subheader("Payment History")
                 st.dataframe(payments, hide_index=True)
+                if not topups.empty:
+                    st.subheader("Top-up History")
+                    st.dataframe(topups, hide_index=True)
             else:
                 st.error("Loan not found.")
 
@@ -352,21 +372,48 @@ with tab6:
 
     st.divider()
     st.subheader("➕ Top-up Loan")
-    topup_amount = st.number_input("Top-up Amount (UGX)", min_value=10000, value=50000, step=10000)
-    topup_months = st.number_input("Additional Months", min_value=1, value=1)
-    if st.button("Add Top-up", type="primary"):
-        loan = pd.read_sql_query("SELECT * FROM loans WHERE id=?", conn, params=(manage_id,))
-        if not loan.empty:
-            new_amount = loan.iloc[0]['amount'] + topup_amount
-            new_total = loan.iloc[0]['total_repayment'] + (topup_amount * (1 + (loan.iloc[0]['interest_rate']/100) * topup_months))
-            new_term = int(loan.iloc[0]['term_months']) + int(topup_months)
-            new_due = datetime.now().date() + timedelta(days=30 * new_term)
+    
+    # Load current loan info for top-up
+    current_loan = pd.read_sql_query("SELECT * FROM loans WHERE id=?", conn, params=(manage_id,))
+    
+    if not current_loan.empty:
+        loan_row = current_loan.iloc[0]
+        current_balance = calculate_balance(loan_row['total_repayment'], loan_row['amount_paid'])
+        
+        st.info(f"📊 Current Balance: **UGX {current_balance:,.0f}**")
+        
+        topup_date = st.date_input("Top-up Date", datetime.now().date(), key="topup_date")
+        topup_amount = st.number_input("Top-up Amount (UGX)", min_value=10000, value=50000, step=10000)
+        topup_months = st.number_input("Additional Months", min_value=1, value=1)
+        
+        if st.button("Add Top-up", type="primary"):
+            # Calculate new values including current balance
+            total_to_finance = current_balance + topup_amount
+            interest_on_topup = topup_amount * (loan_row['interest_rate'] / 100) * topup_months
             
-            c.execute("""UPDATE loans SET amount=?, total_repayment=?, term_months=?, due_date=? WHERE id=?""",
-                      (new_amount, new_total, new_term, str(new_due), manage_id))
+            new_total = loan_row['total_repayment'] + interest_on_topup
+            new_term = int(loan_row['term_months']) + int(topup_months)
+            new_due = topup_date + timedelta(days=30 * topup_months)
+            
+            # Record top-up in topups table
+            c.execute("""INSERT INTO topups (loan_id, topup_amount, topup_date, additional_months, previous_balance, new_due_date)
+                         VALUES (?,?,?,?,?,?)""",
+                      (manage_id, topup_amount, str(topup_date), topup_months, current_balance, str(new_due)))
+            
+            # Update loan record
+            c.execute("""UPDATE loans SET total_repayment=?, term_months=?, due_date=? WHERE id=?""",
+                      (new_total, new_term, str(new_due), manage_id))
             conn.commit()
-            st.success(f"✅ Top-up added successfully!")
+            st.success(f"✅ Top-up added successfully!\n\n**Summary:**\n- Previous Balance: UGX {current_balance:,.0f}\n- Top-up Amount: UGX {topup_amount:,.0f}\n- Interest on Top-up: UGX {interest_on_topup:,.0f}\n- New Due Date: {new_due}")
             st.rerun()
+
+    st.divider()
+    st.subheader("💾 Mark Loan as Completed")
+    if st.button("Mark as Fully Paid", type="secondary", key="mark_completed"):
+        c.execute("UPDATE loans SET loan_status='Completed' WHERE id=?", (manage_id,))
+        conn.commit()
+        st.success("✅ Loan marked as completed!")
+        st.rerun()
 
     st.divider()
     if st.button("✏️ Load for Editing"):
@@ -407,7 +454,8 @@ if st.sidebar.button("Logout"):
     for key in list(st.session_state.keys()):
         del st.session_state[key]
     st.rerun()
-    # ====================== ADMIN ======================
+
+# ====================== ADMIN ======================
 with tab7:
 
     if st.session_state.user_role != "Admin":
