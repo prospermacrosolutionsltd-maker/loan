@@ -22,13 +22,14 @@ c.execute('''CREATE TABLE IF NOT EXISTS loans (
              loan_officer TEXT, frozen INTEGER DEFAULT 0,
              is_balance_frozen INTEGER DEFAULT 0, frozen_balance REAL DEFAULT 0,
              collateral_type TEXT DEFAULT '', admin_fee REAL DEFAULT 0,
-             loan_status TEXT DEFAULT 'Active')''')
+             loan_status TEXT DEFAULT 'Active', customer_id TEXT)''')
 
 # Ensure existing databases have new columns
 for column_sql in [
     "ALTER TABLE loans ADD COLUMN collateral_type TEXT DEFAULT ''",
     "ALTER TABLE loans ADD COLUMN admin_fee REAL DEFAULT 0",
-    "ALTER TABLE loans ADD COLUMN loan_status TEXT DEFAULT 'Active'"
+    "ALTER TABLE loans ADD COLUMN loan_status TEXT DEFAULT 'Active'",
+    "ALTER TABLE loans ADD COLUMN customer_id TEXT"
 ]:
     try:
         c.execute(column_sql)
@@ -86,6 +87,9 @@ def get_loan_status(balance, penalty):
         return "⚠️ Overdue"
     return "Active"
 
+def format_currency(value):
+    """Format numbers with commas for currency display"""
+    return f"UGX {value:,.0f}"
 
 def load_loans():
     loans = pd.read_sql_query("SELECT * FROM loans WHERE loan_status='Active' ORDER BY id ASC", conn)
@@ -119,6 +123,10 @@ def filter_loans(df, borrower, phone, officer, status, overdue):
     if overdue == 'Only overdue':
         df = df[df['penalty'] > 0]
     return df
+
+def generate_customer_id(name, phone):
+    """Generate unique customer ID from name and phone"""
+    return f"{name.replace(' ', '_')}_{phone}"
 
 # ====================== LOGIN ======================
 # Initialize session state defaults
@@ -167,9 +175,9 @@ with tab1:
 
     if not df.empty:
         col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
-        col1.metric("Total Disbursed", f"UGX {df['amount'].sum():,.0f}")
-        col2.metric("Outstanding", f"UGX {df['balance'].sum():,.0f}")
-        col3.metric("Total Collected", f"UGX {total_collected:,.0f}")
+        col1.metric("Total Disbursed", format_currency(df['amount'].sum()))
+        col2.metric("Outstanding", format_currency(df['balance'].sum()))
+        col3.metric("Total Collected", format_currency(total_collected))
         col4.metric("Overdue Loans", len(df[df['penalty'] > 0]))
         col5.metric("Total Loans", len(df))
 
@@ -192,7 +200,8 @@ with tab1:
 
         st.markdown("---")
         with st.expander("📋 Recent Loans", expanded=True):
-            st.dataframe(df[['id', 'borrower_name', 'phone', 'amount', 'balance', 'penalty', 'loan_officer']], use_container_width=True, hide_index=True)
+            display_df = df[['id', 'borrower_name', 'phone', 'amount', 'balance', 'penalty', 'loan_officer']].copy()
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
         st.info("No loans found.")
 
@@ -203,7 +212,7 @@ with tab2:
     with col1:
         name = st.text_input("Borrower Name *")
         phone = st.text_input("Phone Number *")
-        amount = st.number_input("Loan Amount (UGX)", min_value=10000, value=100000, step=5000)
+        amount = st.number_input("Loan Amount (UGX)", min_value=10000, value=100000, step=5000, format="%d")
         officer = st.text_input("Loan Officer", value=st.session_state.username)
     with col2:
         rate = st.number_input("Interest Rate (%)", value=14.0, step=0.5)
@@ -214,25 +223,27 @@ with tab2:
             ["None", "Land Title", "Vehicle", "Equipment", "Property", "Savings"],
             index=0
         )
-        admin_fee_input = st.number_input("Administration Fee (UGX)", min_value=0, value=10000, step=1000,
+        admin_fee_input = st.number_input("Administration Fee (UGX)", min_value=0, value=10000, step=1000, format="%d",
                                          help="This fee is applied only for new customers.")
     
     if st.button("💾 Save New Loan", type="primary"):
         if name and phone:
-            existing_customer = c.execute("SELECT COUNT(*) FROM loans WHERE borrower_name=? AND phone=? AND loan_status='Completed'", (name, phone)).fetchone()[0] > 0
+            customer_id = generate_customer_id(name, phone)
+            # Check if customer has completed a loan before
+            existing_customer = c.execute("SELECT COUNT(*) FROM loans WHERE customer_id=? AND loan_status='Completed'", (customer_id,)).fetchone()[0] > 0
             admin_fee = 0 if existing_customer else admin_fee_input
             total = amount * (1 + (rate / 100) * months) + admin_fee
             due_date = disb_date + timedelta(days=30 * months)
             c.execute("""INSERT INTO loans (borrower_name, phone, amount, interest_rate, term_months, 
-                         total_repayment, disbursement_date, due_date, loan_officer, collateral_type, admin_fee, loan_status)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", 
+                         total_repayment, disbursement_date, due_date, loan_officer, collateral_type, admin_fee, loan_status, customer_id)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
                       (name, phone, amount, rate, months, total, str(disb_date), str(due_date), officer,
-                       collateral_type, admin_fee, 'Active'))
+                       collateral_type, admin_fee, 'Active', customer_id))
             conn.commit()
             if existing_customer:
                 st.success(f"✅ Loan for **{name}** created without administration fee.")
             else:
-                st.success(f"✅ New customer loan created with UGX {admin_fee:,.0f} administration fee.")
+                st.success(f"✅ New customer loan created with {format_currency(admin_fee)} administration fee.")
             st.rerun()
 
 # ====================== PORTFOLIO ======================
@@ -273,7 +284,7 @@ with tab4:
     col1, col2 = st.columns(2)
     with col1:
         loan_id = st.number_input("Loan ID", min_value=1)
-        pay_amount = st.number_input("Payment Amount (UGX)", min_value=1000)
+        pay_amount = st.number_input("Payment Amount (UGX)", min_value=1000, format="%d")
     with col2:
         pay_date = st.date_input("Payment Date", datetime.now().date())
     
@@ -328,7 +339,7 @@ with tab5:
         if not df.empty:
             df['total_due'] = df['balance'] + df['penalty']
             st.metric("Total Loans", len(df))
-            st.metric("Outstanding", f"UGX {df['balance'].sum():,.0f}")
+            st.metric("Outstanding", format_currency(df['balance'].sum()))
             st.metric("Overdue Loans", len(df[df['penalty'] > 0]))
 
             output = io.BytesIO()
@@ -361,7 +372,7 @@ with tab6:
                 bal = calculate_balance(loan.iloc[0]['total_repayment'], loan.iloc[0]['amount_paid'])
                 c.execute("UPDATE loans SET is_balance_frozen=1, frozen_balance=? WHERE id=?", (bal, manage_id))
                 conn.commit()
-                st.success(f"Balance frozen at UGX {bal:,.0f}")
+                st.success(f"Balance frozen at {format_currency(bal)}")
                 st.rerun()
     with col3:
         if st.button("🔓 Unfreeze Balance"):
@@ -380,15 +391,14 @@ with tab6:
         loan_row = current_loan.iloc[0]
         current_balance = calculate_balance(loan_row['total_repayment'], loan_row['amount_paid'])
         
-        st.info(f"📊 Current Balance: **UGX {current_balance:,.0f}**")
+        st.info(f"📊 Current Balance: **{format_currency(current_balance)}**")
         
         topup_date = st.date_input("Top-up Date", datetime.now().date(), key="topup_date")
-        topup_amount = st.number_input("Top-up Amount (UGX)", min_value=10000, value=50000, step=10000)
+        topup_amount = st.number_input("Top-up Amount (UGX)", min_value=10000, value=50000, step=10000, format="%d")
         topup_months = st.number_input("Additional Months", min_value=1, value=1)
         
         if st.button("Add Top-up", type="primary"):
             # Calculate new values including current balance
-            total_to_finance = current_balance + topup_amount
             interest_on_topup = topup_amount * (loan_row['interest_rate'] / 100) * topup_months
             
             new_total = loan_row['total_repayment'] + interest_on_topup
@@ -404,7 +414,13 @@ with tab6:
             c.execute("""UPDATE loans SET total_repayment=?, term_months=?, due_date=? WHERE id=?""",
                       (new_total, new_term, str(new_due), manage_id))
             conn.commit()
-            st.success(f"✅ Top-up added successfully!\n\n**Summary:**\n- Previous Balance: UGX {current_balance:,.0f}\n- Top-up Amount: UGX {topup_amount:,.0f}\n- Interest on Top-up: UGX {interest_on_topup:,.0f}\n- New Due Date: {new_due}")
+            st.success(f"""✅ Top-up added successfully!
+
+**Summary:**
+- Previous Balance: {format_currency(current_balance)}
+- Top-up Amount: {format_currency(topup_amount)}
+- Interest on Top-up: {format_currency(interest_on_topup)}
+- New Due Date: {new_due}""")
             st.rerun()
 
     st.divider()
@@ -429,7 +445,7 @@ with tab6:
         with col1:
             new_name = st.text_input("Borrower Name", loan['borrower_name'])
             new_phone = st.text_input("Phone", loan['phone'])
-            new_amount = st.number_input("Amount", value=float(loan['amount']))
+            new_amount = st.number_input("Amount", value=float(loan['amount']), format="%d")
             new_officer = st.text_input("Officer", loan['loan_officer'])
         with col2:
             new_rate = st.number_input("Rate (%)", value=float(loan['interest_rate']))
