@@ -36,13 +36,17 @@ for column_sql in [
     except sqlite3.OperationalError:
         pass
 
+# Populate customer_id and loan_status for existing records
+try:
+    c.execute("""UPDATE loans SET customer_id = borrower_name || '_' || phone 
+                WHERE customer_id IS NULL OR customer_id = ''""")
+    c.execute("""UPDATE loans SET loan_status = 'Active' WHERE loan_status IS NULL OR loan_status = ''""")
+    conn.commit()
+except:
+    pass
+
 c.execute('''CREATE TABLE IF NOT EXISTS payments (
              id INTEGER PRIMARY KEY, loan_id INTEGER, amount REAL, payment_date TEXT)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS topups (
-             id INTEGER PRIMARY KEY, loan_id INTEGER, topup_amount REAL, 
-             topup_date TEXT, additional_months INTEGER, previous_balance REAL,
-             new_due_date TEXT)''')
 
 # Create topups table if it doesn't exist
 try:
@@ -89,7 +93,10 @@ def get_loan_status(balance, penalty):
 
 def format_currency(value):
     """Format numbers with commas for currency display"""
-    return f"UGX {value:,.0f}"
+    try:
+        return f"UGX {value:,.0f}"
+    except:
+        return f"UGX {value}"
 
 def load_loans():
     loans = pd.read_sql_query("SELECT * FROM loans WHERE loan_status='Active' ORDER BY id ASC", conn)
@@ -110,6 +117,15 @@ def load_loans():
     loans['status'] = loans.apply(lambda x: get_loan_status(x['balance'], x['penalty']), axis=1)
     return loans
 
+def format_loans_display(df):
+    """Format loan dataframe for display with currency formatting"""
+    display_df = df.copy()
+    # Format currency columns with commas
+    currency_cols = ['amount', 'balance', 'penalty', 'total_due', 'amount_paid', 'total_repayment', 'admin_fee']
+    for col in currency_cols:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}")
+    return display_df
 
 def filter_loans(df, borrower, phone, officer, status, overdue):
     if borrower:
@@ -201,6 +217,9 @@ with tab1:
         st.markdown("---")
         with st.expander("📋 Recent Loans", expanded=True):
             display_df = df[['id', 'borrower_name', 'phone', 'amount', 'balance', 'penalty', 'loan_officer']].copy()
+            display_df['amount'] = display_df['amount'].apply(lambda x: f"{x:,.0f}")
+            display_df['balance'] = display_df['balance'].apply(lambda x: f"{x:,.0f}")
+            display_df['penalty'] = display_df['penalty'].apply(lambda x: f"{x:,.0f}")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
         st.info("No loans found.")
@@ -274,7 +293,9 @@ with tab3:
             st.download_button("⬇️ Download Portfolio", output, "portfolio.xlsx", 
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="exp_port")
 
-        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+        # Display with formatted currency
+        display_df = format_loans_display(filtered_df)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
         st.info("No loans found.")
 
@@ -295,7 +316,7 @@ with tab4:
             c.execute("INSERT INTO payments (loan_id, amount, payment_date) VALUES (?,?,?)", (loan_id, pay_amount, pay_date_str))
             c.execute("UPDATE loans SET amount_paid = amount_paid + ? WHERE id=?", (pay_amount, loan_id))
             conn.commit()
-            st.success("✅ Payment recorded!")
+            st.success(f"✅ Payment of {format_currency(pay_amount)} recorded!")
             st.rerun()
         else:
             st.error("Loan ID not found")
@@ -313,12 +334,27 @@ with tab5:
             payments = pd.read_sql_query("SELECT * FROM payments WHERE loan_id=? ORDER BY payment_date DESC", conn, params=(stmt_id,))
             topups = pd.read_sql_query("SELECT * FROM topups WHERE loan_id=? ORDER BY topup_date DESC", conn, params=(stmt_id,))
             if not loan.empty:
-                st.dataframe(loan, hide_index=True)
+                # Format loan display
+                display_loan = loan.copy()
+                for col in ['amount', 'total_repayment', 'amount_paid', 'admin_fee', 'frozen_balance']:
+                    if col in display_loan.columns:
+                        display_loan[col] = display_loan[col].apply(lambda x: f"{x:,.0f}")
+                st.dataframe(display_loan, hide_index=True)
+                
                 st.subheader("Payment History")
-                st.dataframe(payments, hide_index=True)
+                if not payments.empty:
+                    display_payments = payments.copy()
+                    display_payments['amount'] = display_payments['amount'].apply(lambda x: f"{x:,.0f}")
+                    st.dataframe(display_payments, hide_index=True)
+                else:
+                    st.info("No payments recorded")
+                    
                 if not topups.empty:
                     st.subheader("Top-up History")
-                    st.dataframe(topups, hide_index=True)
+                    display_topups = topups.copy()
+                    display_topups['topup_amount'] = display_topups['topup_amount'].apply(lambda x: f"{x:,.0f}")
+                    display_topups['previous_balance'] = display_topups['previous_balance'].apply(lambda x: f"{x:,.0f}")
+                    st.dataframe(display_topups, hide_index=True)
             else:
                 st.error("Loan not found.")
 
@@ -331,7 +367,10 @@ with tab5:
             output.seek(0)
             st.download_button("⬇️ Download Overdue Report", output, "overdue_loans.xlsx", 
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="exp_overdue")
-            st.dataframe(overdue, use_container_width=True, hide_index=True)
+            
+            # Display with formatted currency
+            display_df = format_loans_display(overdue)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
         else:
             st.success("🎉 No overdue loans at the moment!")
 
@@ -349,7 +388,9 @@ with tab5:
             st.download_button("⬇️ Download Portfolio Summary", output, "portfolio_summary.xlsx", 
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="exp_summary")
 
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            # Display with formatted currency
+            display_df = format_loans_display(df)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
         else:
             st.info("No loans found.")
 
